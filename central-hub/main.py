@@ -25,15 +25,24 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    sync_task = asyncio.create_task(sync_nodes_task())
-    yield
-    sync_task.cancel()
-    await engine.dispose()
+
+    task = asyncio.create_task(sync_nodes_task())
+
+    try:
+        yield
+    finally:
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        await engine.dispose()
 
 
 app = FastAPI(

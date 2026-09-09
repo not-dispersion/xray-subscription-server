@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
@@ -103,12 +104,10 @@ def build_link(client_uuid: str, email: str) -> str:
 
     if len(pbk) == 42:
         pbk += "="
-
     encoded_pbk = urllib.parse.quote(pbk, safe="")
-
     return (
         f"vless://{client_uuid}@{host}:{port}"
-        f"?security=reality&sni={sni}&fp=chrome&pbk={pbk}&sid={sid}&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#{email}"
+        f"?security=reality&sni={sni}&fp=firefox&pbk={pbk}&sid={sid}&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#{email}"
     )
 
 

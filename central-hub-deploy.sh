@@ -772,6 +772,6 @@ while true; do
         pause
     fi
 done
-EOF 
+EOF
 
 chmod +x /usr/local/bin/central-hub-cli

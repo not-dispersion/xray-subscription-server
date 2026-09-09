@@ -26,7 +26,7 @@ Prerequisites: Point your root domain (`example.com`) and API subdomain (`api.ex
 Run this command on your clean Ubuntu/Debian server:
 
 ```bash
-wget -qO install.sh [https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/refs/heads/main/central-hub-deploy.sh](https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/refs/heads/main/central-hub-deploy.sh) && sudo bash install.sh && rm install.sh
+wget -qO install.sh https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/refs/heads/main/central-hub-deploy.sh && sudo bash install.sh && rm install.sh
 
 ```
 
@@ -50,11 +50,6 @@ sudo central-hub-cli
 
 2. Select option **`10` (`Generate Node Installation Command`)**. Copy the generated green command string.
 3. Paste and run that command on your remote node server (Ubuntu/Debian):
-```bash
-curl -sSL [https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/main/node-deploy.sh](https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/main/node-deploy.sh) | sudo transfer_domain="api.example.com" transfer_key="<YOUR_GENERATED_KEY>" bash
-
-```
-
 
 *The script installs the Node Agent, provisions UFW rules to accept control traffic **only** from the Central Hub IP, and starts the systemd service.*
 4. Return to `central-hub-cli` on the Central Hub and select option **`1` (`Add remote node`)**:
