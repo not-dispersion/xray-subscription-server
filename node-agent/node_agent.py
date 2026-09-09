@@ -39,10 +39,11 @@ def load_static_params():
     if os.path.exists(KEYS_PATH):
         with open(KEYS_PATH, "r", encoding="utf-8") as f:
             for line in f:
-                if line.startswith("Password:"):
-                    pbk = line.split(":", 1)[1].strip()
-                elif line.startswith("shortsid:"):
-                    sid = line.split(":", 1)[1].strip()
+                line_lower = line.lower()
+                if "password" in line_lower or "public" in line_lower:
+                        pbk = line.split(":", 1)[1].strip()
+                elif "shortsid" in line_lower or "short id" in line_lower:
+                        sid = line.split(":", 1)[1].strip()
 
     NODE_CACHE["pbk"] = pbk
     NODE_CACHE["sid"] = sid

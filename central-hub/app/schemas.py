@@ -25,6 +25,7 @@ class UserResponse(BaseModel):
     id: int
     surname: str
     device_limit: int | None = None
+    used_devices: int = 0
     link: str | None = None
 
     model_config = ConfigDict(from_attributes=True)

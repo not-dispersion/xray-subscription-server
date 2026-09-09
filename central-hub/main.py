@@ -284,35 +284,11 @@ async def get_users(request: Request, db: AsyncSession = Depends(get_db)):
             id=u.id,
             surname=u.surname,
             device_limit=u.link.device_limit if u.link else None,
+            used_devices=len(u.link.devices) if u.link else 0,
             link=build_sub_url(request, u.link.token) if u.link else None,
         )
         for u in users
     ]
-
-
-@app.get(
-    "/users/{user_id}",
-    dependencies=[Depends(admin_auth)],
-    response_model=UserResponse,
-    tags=["Users"],
-)
-async def get_user_by_id(
-    user_id: int, request: Request, db: AsyncSession = Depends(get_db)
-):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
-        )
-
-    sub_url = build_sub_url(request, user.link.token) if user.link else None
-    return UserResponse(
-        id=user.id,
-        surname=user.surname,
-        device_limit=user.link.device_limit if user.link else None,
-        link=sub_url,
-    )
 
 
 @app.patch(

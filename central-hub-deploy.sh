@@ -22,20 +22,31 @@ done
 
 ip=$(curl -4 -s icanhazip.com)
 
-read -p "Enter your domain name: " domain
+read -rp "Enter your root domain (e.g. example.com): " domain
 domain=$(echo "$domain" | sed -e 's|^[^/]*//||' -e 's|/.*$||' | xargs)
 [[ -n "$domain" ]] || { echo "Domain cannot be empty."; exit 1; }
-echo "Your domain is: $domain"
 
-domain_ip=$(getent ahostsv4 "$domain" | awk '{ print $1 }' | head -n1)
-echo "Domain A-record: $domain_ip"
-echo "Server IP: $ip"
+api_domain="api.$domain"
+echo "Root domain (Vue web): $domain"
+echo "API domain (Central Hub): $api_domain"
+
+domain_ip=$(getent ahostsv4 "$domain" | awk '{ print $1 }' | head -n1 || true)
+api_ip=$(getent ahostsv4 "$api_domain" | awk '{ print $1 }' | head -n1 || true)
+
+echo "Server detected IP: $ip"
+echo "$domain A-record:    ${domain_ip:-NOT FOUND}"
+echo "$api_domain A-record: ${api_ip:-NOT FOUND}"
 
 [[ "$domain_ip" == "$ip" ]] || {
-    echo "Error: A-record and server IP don't match."
+    echo "Error: A-record for $domain does not match server IP ($ip)."
     exit 1
 }
-echo "DNS check: OK"
+
+[[ "$api_ip" == "$ip" ]] || {
+    echo "Error: A-record for $api_domain does not match server IP ($ip)."
+    exit 1
+}
+echo "DNS checks: OK"
 
 read -p "Enter Let's Encrypt email (for SSL renewal alerts): " cert_email
 [[ -n "$cert_email" ]] || { echo "Email cannot be empty."; exit 1; }
@@ -52,6 +63,7 @@ apt-get install -y --no-install-recommends \
     nginx \
     certbot \
     python3-certbot-nginx \
+    bsdextrautils \
     curl \
     jq \
     sqlite3 \
@@ -115,10 +127,29 @@ else
     echo "FastAPI backend: OK"
 fi
 
+mkdir -p "/var/www/$domain"
+cat <<EOF > "/var/www/$domain/index.html"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$domain</title>
+</head>
+<body style="font-family: system-ui, -apple-system, sans-serif; display: grid; place-content: center; height: 100vh; margin: 0; background: #0f172a; color: #f8fafc; text-align: center;">
+    <main>
+        <h1 style="font-size: 2.5rem; margin-bottom: 0.5rem;">$domain</h1>
+        <p style="color: #94a3b8;">Frontend placeholder. Deploy your Vue build files to <code>/var/www/$domain</code></p>
+    </main>
+</body>
+</html>
+EOF
+
 cat <<EOF > "/etc/nginx/sites-available/$domain"
+# central hub API backend
 server {
     listen 80;
-    server_name $domain;
+    server_name $api_domain;
 
     location / {
         proxy_pass http://127.0.0.1:8000;
@@ -127,6 +158,18 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+
+# web frontend (Vue SPA)
+server {
+    listen 80;
+    server_name $domain;
+    root /var/www/$domain;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
     }
 }
 EOF
@@ -139,32 +182,119 @@ systemctl reload nginx
 
 certbot --nginx \
     -d "$domain" \
+    -d "$api_domain" \
     --non-interactive \
     --agree-tos \
     -m "$cert_email" \
     --redirect
 
-systemctl reload nginx
-echo "Nginx & SSL configured successfully on https://$domain"
+echo "Nginx & SSL configured successfully:"
+echo " - Web: https://$domain"
+echo " - API: https://$api_domain"
 
-cat <<EOF > "/usr/local/bin/crl-hub-ctl"
+cat <<EOF > "/usr/local/bin/central-hub-cli"
 #!/bin/bash
 set -euo pipefail
 
-[[ $EUID -eq 0 ]] || { echo "Error: Please run as root (sudo crl-hub-ctl)"; exit 1; }
+[[ \$EUID -eq 0 ]] || {
+    echo "Error: Please run as root (sudo central-hub-cli)"
+    exit 1
+}
 
-hub_domain="$domain"
-api_url="https://$domain"
+hub_domain="$api_domain"
+api_url="https://$api_domain"
 env_file="$install_dir/central-hub/.env"
 EOF
 
-cat <<'EOF' >> "/usr/local/bin/crl-hub-ctl"
+cat <<'EOF' >> "/usr/local/bin/central-hub-cli"
 
-admin_key=$(grep -E '^(ADMIN_API_KEY)=' "$env_file" | cut -d '=' -f2- | tr -d '\r"')
+required_commands=(
+    curl
+    jq
+    grep
+    cut
+    tr
+    sed
+    column
+    systemctl
+    journalctl
+)
+
+for command in "${required_commands[@]}"; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        echo "Error: Required command '$command' is not installed."
+        exit 1
+    fi
+done
+
+if [[ ! -f "$env_file" ]]; then
+    echo "Error: Environment file not found: $env_file"
+    exit 1
+fi
+
+admin_key=$(grep -E '^ADMIN_API_KEY=' "$env_file" | cut -d '=' -f2- | tr -d '\r"')
 if [[ -z "$admin_key" ]]; then
     echo "Error: ADMIN_API_KEY is missing in $env_file"
     exit 1
 fi
+
+pause() {
+    while read -r -t 0 2>/dev/null; do read -r -n 1; done
+    read -n 1 -s -r -p "Press any key to continue..."
+    echo
+}
+
+print_error_response() {
+    local body="$1"
+
+    if [[ -n "$body" ]]; then
+        echo "$body" | jq . 2>/dev/null || echo "$body"
+    else
+        echo "No response body."
+    fi
+}
+
+api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local payload="${3:-}"
+
+    local http_code
+    local curl_args=(
+        --silent
+        --show-error
+        --request "$method"
+        "$api_url$endpoint"
+        -H "Authorization: Bearer $admin_key"
+    )
+
+    if [[ -n "$payload" ]]; then
+        curl_args+=(
+            -H "Content-Type: application/json"
+            --data "$payload"
+        )
+    fi
+
+    local response
+    local curl_exit_code=0
+    
+    set +e
+    response=$(curl "${curl_args[@]}" -w "%{http_code}" 2>&1)
+    curl_exit_code=$?
+    set -e
+
+    if (( curl_exit_code != 0 )); then
+        echo
+        echo "[ERROR] Failed to connect to backend."
+        echo "$response"
+        return 1
+    fi
+
+    API_CODE="${response: -3}"
+    API_BODY="${response:0:${#response}-3}"
+
+    return 0
+}
 
 prompt_non_empty() {
     local prompt_text="$1"
@@ -173,8 +303,8 @@ prompt_non_empty() {
     while true; do
         read -rp "$prompt_text: " input
         if [[ -n "${input// /}" ]]; then
-            eval "$var_name=\"$input\""
-            break
+            printf -v "$var_name" '%s' "$input"
+            return 0
         fi
         echo " [!] Field cannot be empty. Try again."
     done
@@ -196,9 +326,10 @@ prompt_integer() {
             read -rp "$prompt_text: " input
         fi
 
-        if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= min_val && input <= max_val )); then
-            eval "$var_name=\"$input\""
-            break
+        if [[ "$input" =~ ^[0-9]+$ ]] &&
+            (( 10#$input >= min_val && 10#$input <= max_val )); then
+            printf -v "$var_name" '%s' "$input"
+            return 0
         fi
         echo " [!] Invalid input. Enter an integer between $min_val and $max_val."
     done
@@ -213,8 +344,8 @@ prompt_url() {
     while true; do
         read -rp "$prompt_text (e.g. http://1.2.3.4:8443): " input
         if [[ "$input" =~ $url_regex ]]; then
-            eval "$var_name=\"$input\""
-            break
+            printf -v "$var_name" '%s' "$input"
+            return 0
         fi
         echo " [!] Invalid URL syntax. Must begin with http:// or https://."
     done
@@ -226,55 +357,88 @@ add_node() {
     prompt_url "Node API URL" node_api_url
 
     local payload
-    payload=$(jq -n --arg n "$name" --arg u "$node_api_url" '{name: $n, api_url: $u}')
+    payload=$(jq -n \
+        --arg name "$name" \
+        --arg api_url "$node_api_url" \
+        '{
+            name: $name,
+            api_url: $api_url
+        }')
 
-    local resp code body
-    resp=$(curl -s -w "\n%{http_code}" -X POST "$api_url/nodes" \
-        -H "Authorization: Bearer $admin_key" \
-        -H "Content-Type: application/json" \
-        -d "$payload")
-    code=$(echo "$resp" | tail -n1)
-    body=$(echo "$resp" | sed '$d')
+    if ! api_request "POST" "/nodes" "$payload"; then
+        return
+    fi
 
-    if [[ "$code" == "201" ]]; then
-        echo -e "\n[OK] Node registered successfully:"
-        echo "$body" | jq .
+    if [[ "$API_CODE" == "201" ]]; then
+        echo
+        echo "[OK] Node registered successfully:"
+
+        echo "$API_BODY" |
+            jq -r '
+                ["ID", "NAME", "ACTIVE", "API_URL"],
+                ["--", "----", "------", "-------"],
+                [.id, .name, .is_active, .api_url] |
+                @tsv
+            ' |
+            column -t
     else
-        echo -e "\n[ERROR] Request failed (HTTP $code):"
-        echo "$body" | jq . 2>/dev/null || echo "$body"
+        echo
+        echo "[ERROR] Request failed (HTTP $API_CODE):"
+        print_error_response "$API_BODY"
     fi
 }
 
 list_nodes() {
     echo "--- [2] All Registered Nodes ---"
-    local resp code body
-    resp=$(curl -s -w "\n%{http_code}" -X GET "$api_url/nodes" \
-        -H "Authorization: Bearer $admin_key")
-    code=$(echo "$resp" | tail -n1)
-    body=$(echo "$resp" | sed '$d')
+    if ! api_request "GET" "/nodes"; then
+        return
+    fi
 
-    if [[ "$code" == "200" ]]; then
-        echo "$body" | jq -r '["ID", "NAME", "ACTIVE", "API_URL"], ["--", "----", "------", "-------"], (.[] | [.id, .name, .is_active, .api_url]) | @tsv' | column -t
+    if [[ "$API_CODE" == "200" ]]; then
+        if [[ "$(echo "$API_BODY" | jq 'length')" -eq 0 ]]; then
+            echo "No nodes registered."
+            return
+        fi
+
+        echo "$API_BODY" |
+            jq -r '
+                ["ID", "NAME", "ACTIVE", "API_URL"],
+                ["--", "----", "------", "-------"],
+                (.[] | [.id, .name, .is_active, .api_url]) |
+                @tsv
+            ' |
+            column -t
     else
-        echo "[ERROR] Failed to fetch nodes (HTTP $code): $body"
+        echo "[ERROR] Failed to fetch nodes (HTTP $API_CODE):"
+        print_error_response "$API_BODY"
     fi
 }
 
 delete_node() {
     echo "--- [3] Delete Node ---"
+    list_nodes
+    echo
     prompt_integer "Node ID" node_id "" 1 1000000
 
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$api_url/nodes/$node_id" \
-        -H "Authorization: Bearer $admin_key")
-
-    if [[ "$code" == "204" ]]; then
-        echo -e "\n[OK] Node #$node_id and its client mappings deleted successfully."
-    elif [[ "$code" == "404" ]]; then
-        echo -e "\n[!] Node #$node_id not found."
-    else
-        echo -e "\n[ERROR] Failed to delete node (HTTP $code)."
+    if ! api_request "DELETE" "/nodes/$node_id"; then
+        return
     fi
+
+    case "$API_CODE" in
+        204)
+            echo
+            echo "[OK] Node #$node_id and its client mappings deleted successfully."
+            ;;
+        404)
+            echo
+            echo "[!] Node #$node_id not found."
+            ;;
+        *)
+            echo
+            echo "[ERROR] Failed to delete node (HTTP $API_CODE):"
+            print_error_response "$API_BODY"
+            ;;
+    esac
 }
 
 add_user() {
@@ -283,61 +447,75 @@ add_user() {
     prompt_integer "Device Limit" device_limit "1" 1 50
 
     local payload
-    payload=$(jq -n --arg s "$surname" --argjson d "$device_limit" '{surname: $s, device_limit: $d}')
+    payload=$(jq -n \
+        --arg surname "$surname" \
+        --argjson device_limit "$device_limit" \
+        '{
+            surname: $surname,
+            device_limit: $device_limit
+        }')
 
-    local resp code body
-    resp=$(curl -s -w "\n%{http_code}" -X POST "$api_url/users" \
-        -H "Authorization: Bearer $admin_key" \
-        -H "Content-Type: application/json" \
-        -d "$payload")
-    code=$(echo "$resp" | tail -n1)
-    body=$(echo "$resp" | sed '$d')
+    if ! api_request "POST" "/users" "$payload"; then
+        return
+    fi
 
-    if [[ "$code" == "201" ]]; then
-        echo -e "\n[OK] User created successfully:"
-        echo "$body" | jq .
+    if [[ "$API_CODE" == "201" ]]; then
+        echo
+        echo "[OK] User created successfully:"
+
+        echo "$API_BODY" |
+            jq -r '
+                ["ID", "SURNAME", "DEVICES", "SUBSCRIPTION LINK"],
+                ["--", "-------", "-------", "-----------------"],
+                [.id, .surname, "\(.used_devices // 0)/\(.device_limit)", .link] |
+                @tsv
+            ' |
+            column -t
     else
-        echo -e "\n[ERROR] Request failed (HTTP $code):"
-        echo "$body" | jq . 2>/dev/null || echo "$body"
+        echo
+        echo "[ERROR] Request failed (HTTP $API_CODE):"
+        print_error_response "$API_BODY"
     fi
 }
 
 list_users() {
     echo "--- [5] All Users ---"
-    local resp code body
-    resp=$(curl -s -w "\n%{http_code}" -X GET "$api_url/users" \
-        -H "Authorization: Bearer $admin_key")
-    code=$(echo "$resp" | tail -n1)
-    body=$(echo "$resp" | sed '$d')
-
-    if [[ "$code" == "200" ]]; then
-        echo "$body" | jq -r '["ID", "SURNAME", "LIMIT", "SUBSCRIPTION LINK"], ["--", "-------", "-----", "-----------------"], (.[] | [.id, .surname, .device_limit, .link]) | @tsv' | column -t
-    else
-        echo "[ERROR] Failed to fetch users (HTTP $code): $body"
+    if ! api_request "GET" "/users"; then
+        return
     fi
-}
 
-get_user() {
-    echo "--- [6] Get User Details ---"
-    prompt_integer "User ID" user_id "" 1 1000000
+    if [[ "$API_CODE" == "200" ]]; then
+        if [[ "$(echo "$API_BODY" | jq 'length')" -eq 0 ]]; then
+            echo "No users registered."
+            return
+        fi
 
-    local resp code body
-    resp=$(curl -s -w "\n%{http_code}" -X GET "$api_url/users/$user_id" \
-        -H "Authorization: Bearer $admin_key")
-    code=$(echo "$resp" | tail -n1)
-    body=$(echo "$resp" | sed '$d')
-
-    if [[ "$code" == "200" ]]; then
-        echo "$body" | jq .
-    elif [[ "$code" == "404" ]]; then
-        echo "[!] User #$user_id not found."
+        echo "$API_BODY" |
+            jq -r '
+                ["ID", "SURNAME", "DEVICES", "SUBSCRIPTION LINK"],
+                ["--", "-------", "-------", "-----------------"],
+                (
+                    .[] |
+                    [
+                        .id,
+                        .surname,
+                        "\(.used_devices)/\(.device_limit)",
+                        .link
+                    ]
+                ) |
+                @tsv
+            ' |
+            column -t
     else
-        echo "[ERROR] HTTP $code: $body"
+        echo "[ERROR] Failed to fetch users (HTTP $API_CODE):"
+        print_error_response "$API_BODY"
     fi
 }
 
 patch_user() {
-    echo "--- [7] Update User ---"
+    echo "--- [6] Update User ---"
+    list_users
+    echo
     prompt_integer "User ID to update" user_id "" 1 1000000
     read -rp "New Surname (Leave empty to keep unchanged): " surname
     read -rp "New Device Limit 1-50 (Leave empty to keep unchanged): " limit
@@ -349,99 +527,149 @@ patch_user() {
 
     local payload="{}"
     if [[ -n "$surname" ]]; then
-        payload=$(echo "$payload" | jq --arg s "$surname" '. + {surname: $s}')
+        payload=$(jq \
+            --arg surname "$surname" \
+            '. + {surname: $surname}' <<< "$payload")
     fi
     if [[ -n "$limit" ]]; then
-        if [[ "$limit" =~ ^[0-9]+$ ]] && (( limit >= 1 && limit <= 50 )); then
-            payload=$(echo "$payload" | jq --argjson l "$limit" '. + {device_limit: $l}')
+         if [[ "$limit" =~ ^[0-9]+$ ]] &&
+           (( 10#$limit >= 1 && 10#$limit <= 50 )); then
+
+            payload=$(jq \
+                --argjson device_limit "$limit" \
+                '. + {device_limit: $device_limit}' <<< "$payload")
         else
             echo "[!] Invalid device limit. Must be 1-50. Aborted."
             return
         fi
     fi
 
-    local resp code body
-    resp=$(curl -s -w "\n%{http_code}" -X PATCH "$api_url/users/$user_id" \
-        -H "Authorization: Bearer $admin_key" \
-        -H "Content-Type: application/json" \
-        -d "$payload")
-    code=$(echo "$resp" | tail -n1)
-    body=$(echo "$resp" | sed '$d')
+    if ! api_request "PATCH" "/users/$user_id" "$payload"; then
+        return
+    fi
 
-    if [[ "$code" == "200" ]]; then
-        echo -e "\n[OK] User updated:"
-        echo "$body" | jq .
+    if [[ "$API_CODE" == "200" ]]; then
+        echo
+        echo "[OK] User updated successfully:"
+
+        echo "$API_BODY" |
+            jq -r '
+                ["ID", "SURNAME", "DEVICES", "SUBSCRIPTION LINK"],
+                ["--", "-------", "-------", "-----------------"],
+                [.id, .surname, "\(.used_devices // 0)/\(.device_limit)", .link] |
+                @tsv
+            ' |
+            column -t
     else
-        echo -e "\n[ERROR] HTTP $code:"
-        echo "$body" | jq . 2>/dev/null || echo "$body"
+        echo
+        echo "[ERROR] Request failed (HTTP $API_CODE):"
+        print_error_response "$API_BODY"
     fi
 }
 
 delete_user() {
-    echo "--- [8] Delete User ---"
+    echo "--- [7] Delete User ---"
+    list_users
+    echo
     prompt_integer "User ID" user_id "" 1 1000000
 
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$api_url/users/$user_id" \
-        -H "Authorization: Bearer $admin_key")
-
-    if [[ "$code" == "204" ]]; then
-        echo -e "\n[OK] User #$user_id and link dropped from all nodes."
-    elif [[ "$code" == "404" ]]; then
-        echo -e "\n[!] User #$user_id not found."
-    else
-        echo -e "\n[ERROR] Failed to delete user (HTTP $code)."
+    if ! api_request "DELETE" "/users/$user_id"; then
+        return
     fi
+
+    case "$API_CODE" in
+        204)
+            echo
+            echo "[OK] User #$user_id and link dropped from all nodes."
+            ;;
+        404)
+            echo
+            echo "[!] User #$user_id not found."
+            ;;
+        *)
+            echo
+            echo "[ERROR] Failed to delete user (HTTP $API_CODE):"
+            print_error_response "$API_BODY"
+            ;;
+    esac
 }
 
 list_devices() {
-    echo "--- [9] User Active Devices ---"
+    echo "--- [8] User Active Devices ---"
+    list_users
+    echo
     prompt_integer "User ID" user_id "" 1 1000000
 
-    local resp code body
-    resp=$(curl -s -w "\n%{http_code}" -X GET "$api_url/users/$user_id/devices" \
-        -H "Authorization: Bearer $admin_key")
-    code=$(echo "$resp" | tail -n1)
-    body=$(echo "$resp" | sed '$d')
+    if ! api_request "GET" "/users/$user_id/devices"; then
+        return
+    fi
 
-    if [[ "$code" == "200" ]]; then
+    if [[ "$API_CODE" == "200" ]]; then
         local count
-        count=$(echo "$body" | jq '. | length')
+        count=$(echo "$API_BODY" | jq 'length')
+
         if [[ "$count" -eq 0 ]]; then
             echo "No devices registered for this user yet."
-        else
-            echo "$body" | jq -r '["SLOT", "DEVICE HWID", "OS", "CREATED AT"], ["----", "-----------", "--", "----------"], (.[] | [.slot, .device_identifier, .device_os, .created_at]) | @tsv' | column -t
+            return
         fi
-    elif [[ "$code" == "404" ]]; then
+
+        echo "$API_BODY" |
+            jq -r '
+                ["SLOT", "DEVICE HWID", "OS", "CREATED AT"],
+                ["----", "-----------", "--", "----------"],
+                (
+                    .[] |
+                    [
+                        .slot,
+                        .device_identifier,
+                        .device_os,
+                        .created_at
+                    ]
+                ) |
+                @tsv
+            ' |
+            column -t
+    elif [[ "$API_CODE" == "404" ]]; then
         echo "[!] User or subscription not found."
     else
-        echo "[ERROR] HTTP $code: $body"
+        echo "[ERROR] Request failed (HTTP $API_CODE):"
+        print_error_response "$API_BODY"
     fi
 }
 
 delete_device() {
-    echo "--- [10] Delete Device Slot ---"
+    echo "--- [9] Delete Device Slot ---"
     prompt_integer "User ID" user_id "" 1 1000000
     prompt_integer "Slot Number" slot "" 1 50
 
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$api_url/users/$user_id/devices/$slot" \
-        -H "Authorization: Bearer $admin_key")
-
-    if [[ "$code" == "204" ]]; then
-        echo -e "\n[OK] Device in slot #$slot deleted. Slots re-indexed."
-    elif [[ "$code" == "404" ]]; then
-        echo -e "\n[!] Slot or user not found."
-    else
-        echo -e "\n[ERROR] HTTP $code."
+    if ! api_request "DELETE" "/users/$user_id/devices/$slot"; then
+        return
     fi
+
+    case "$API_CODE" in
+        204)
+            echo
+            echo "[OK] Device in slot #$slot deleted. Slots re-indexed."
+            ;;
+        404)
+            echo
+            echo "[!] Slot or user not found."
+            ;;
+        *)
+            echo
+            echo "[ERROR] Failed to delete device (HTTP $API_CODE):"
+            print_error_response "$API_BODY"
+            ;;
+    esac
 }
 
 generate_node_cmd() {
-    echo "--- [11] Generate Node Installation Command ---"
+    echo "--- [10] Generate Node Installation Command ---"
     
     local node_key
-    node_key=$(grep -E '^(NODE_KEY)=' "$env_file" | cut -d '=' -f2- | tr -d '\r"')
+    node_key=$(grep -E '^NODE_KEY=' "$env_file" |
+        cut -d '=' -f2- |
+        tr -d '\r"')
 
     if [[ -z "$node_key" ]]; then
         echo "[ERROR] NODE_KEY not found in $env_file"
@@ -453,15 +681,44 @@ generate_node_cmd() {
     echo
     echo "Run this command on your remote node (Ubuntu/Debian):"
     echo "--------------------------------------------------------------------------------"
-    echo -e "\e[32mcurl -sSL $repo_script | sudo transfer_domain=\"$hub_domain\" transfer_key=\"$node_key\" bash\e[0m"
+    printf '\033[32m%s\033[0m\n' \
+        "curl -sSL $repo_script | sudo transfer_domain=\"$hub_domain\" transfer_key=\"$node_key\" bash"
     echo "--------------------------------------------------------------------------------"
-    echo "This will install the node agent and bind it to this Central Hub automatically."
+    echo
+    echo "The node agent will be installed and registered with this Central Hub."
+}
+
+view_logs() {
+    echo "--- [11] Central Hub Live Logs ---"
+    echo "Streaming logs (press Ctrl+C to stop)..."
+    echo
+
+    trap 'echo ""; return 0' INT
+    journalctl -u central-hub -n 50 -f || true
+    trap - INT
+
+    while read -r -t 0 2>/dev/null; do read -r -n 1; done
+    SKIP_PAUSE=1
+}
+
+restart_service() {
+    echo "--- [12] Restart Central Hub ---"
+
+    if systemctl restart central-hub; then
+        echo
+        echo "[OK] Central Hub service restarted successfully."
+    else
+        echo
+        echo "[ERROR] Failed to restart central-hub."
+        echo
+        systemctl status central-hub --no-pager || true
+    fi
 }
 
 show_menu() {
     clear
     echo "=================================================="
-    echo "         VPN SUBSCRIPTION MANAGER CLI             "
+    echo "                 CENTRAL HUB CLI"
     echo "=================================================="
     echo " [Nodes]"
     echo "   1) Add remote node"
@@ -471,18 +728,17 @@ show_menu() {
     echo " [Users]"
     echo "   4) Add user"
     echo "   5) List users"
-    echo "   6) Get user by ID"
-    echo "   7) Update user (surname / limit)"
-    echo "   8) Delete user"
+    echo "   6) Update user (surname / limit)"
+    echo "   7) Delete user"
     echo
     echo " [Devices & Slots]"
-    echo "   9) List user devices (slots)"
-    echo "  10) Delete device by slot"
+    echo "   8) List user devices (slots)"
+    echo "   9) Delete device by slot"
     echo
     echo " [Diagnostics]"
-    echo "  11) Show node setup link"
-    echo "  12) View live systemd logs"
-    echo "  13) Restart central-hub service"
+    echo "  10) Show node setup link"
+    echo "  11) View live systemd logs"
+    echo "  12) Restart central-hub service"
     echo
     echo "   0) Exit"
     echo "=================================================="
@@ -490,7 +746,7 @@ show_menu() {
 
 while true; do
     show_menu
-    read -rp "Select option [0-13]: " choice
+    read -rp "Select option [0-12]: " choice
     echo
     case "$choice" in
         1) add_node ;;
@@ -498,21 +754,24 @@ while true; do
         3) delete_node ;;
         4) add_user ;;
         5) list_users ;;
-        6) get_user ;;
-        7) patch_user ;;
-        8) delete_user ;;
-        9) list_devices ;;
-        10) delete_device ;;
-        11) generate_node_cmd ;;
-        12) journalctl -u central-hub -f ;;
-        13) systemctl restart central-hub && echo "Service restarted." ;;
+        6) patch_user ;;
+        7) delete_user ;;
+        8) list_devices ;;
+        9) delete_device ;;
+        10) generate_node_cmd ;;
+        11) view_logs ;;
+        12) restart_service ;;
         0) echo "Goodbye!"; exit 0 ;;
-        *) echo "Invalid option." ;;
+        *) echo "[!] Invalid option. Enter a number between 0 and 12." ;;
     esac
     echo
-    read -rp "Press Enter to continue..."
+    if [[ "${SKIP_PAUSE:-0}" == "1" ]]; then
+        SKIP_PAUSE=0
+    else
+        echo
+        pause
+    fi
 done
-EOF
+EOF 
 
-chmod +x /usr/local/bin/crl-hub-ctl
-
+chmod +x /usr/local/bin/central-hub-cli
