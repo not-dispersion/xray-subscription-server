@@ -108,7 +108,7 @@ def build_link(client_uuid: str, email: str) -> str:
 
     return (
         f"vless://{client_uuid}@{host}:{port}"
-        f"?security=reality&sni={sni}&fp=firefox&pbk={pbk}&sid={sid}&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#{email}"
+        f"?security=reality&sni={sni}&fp=chrome&pbk={pbk}&sid={sid}&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#{email}"
     )
 
 
