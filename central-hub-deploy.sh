@@ -676,7 +676,7 @@ generate_node_cmd() {
         return
     fi
 
-    local repo_script="https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/main/node-deploy.sh"
+    local repo_script="https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/main/node-agent-deploy.sh"
 
     echo
     echo "Run this command on your remote node (Ubuntu/Debian):"

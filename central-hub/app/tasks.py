@@ -6,19 +6,22 @@ from sqlalchemy import select
 from app.database import AsyncSessionLocal
 from app.models import Link, Node, LinkNode
 from app.node_client import (
-    create_user_on_node,
+    create_users_batch_on_node,
     delete_user_from_node,
     list_users_on_node,
     ping_node,
 )
+
 SYNC_INTERVAL = 60
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{22}$")
+
 
 def extract_uuid(key: str) -> str | None:
     try:
         return urlparse(key).username
     except Exception:
         return None
+
 
 async def sync_nodes_task():
     while True:
@@ -28,6 +31,7 @@ async def sync_nodes_task():
             print(f"Sync error: {e}")
 
         await asyncio.sleep(SYNC_INTERVAL)
+
 
 async def reconcile_once():
     async with AsyncSessionLocal() as db:
@@ -55,26 +59,42 @@ async def reconcile_once():
                 if TOKEN_RE.match(email)
             }
 
+            users_to_batch = []
+            links_to_update = {}
+
             for link in all_links:
                 mapping = mapping_dict.get((link.id, node.id))
                 remote_uuid = managed_remote_users.get(link.token)
 
                 if mapping is None:
-                    key = await create_user_on_node(node.api_url, link.token)
-                    if key:
-                        new_mapping = LinkNode(link_id=link.id, node_id=node.id, key=key)
-                        db.add(new_mapping)
-                        mapping_dict[(link.id, node.id)] = new_mapping
-                    continue
+                    users_to_batch.append({"email": link.token, "uuid": None})
+                    links_to_update[link.token] = (link, None)
+                else:
+                    db_uuid = extract_uuid(mapping.key)
+                    if remote_uuid is None or remote_uuid != db_uuid:
+                        users_to_batch.append({"email": link.token, "uuid": db_uuid})
+                        links_to_update[link.token] = (link, mapping)
 
-                db_uuid = extract_uuid(mapping.key)
+            if users_to_batch:
+                batch_results = await create_users_batch_on_node(node.api_url, users_to_batch)
+                if batch_results:
+                    for item in batch_results:
+                        token = item.get("email")
+                        key = item.get("key")
+                        if not token or not key:
+                            continue
 
-                if remote_uuid is None or remote_uuid != db_uuid:
-                    key = await create_user_on_node(
-                        node.api_url, link.token, client_uuid=db_uuid
-                    )
-                    if key:
-                        mapping.key = key
+                        link_info = links_to_update.get(token)
+                        if not link_info:
+                            continue
+
+                        link_obj, mapping_obj = link_info
+                        if mapping_obj is None:
+                            new_mapping = LinkNode(link_id=link_obj.id, node_id=node.id, key=key)
+                            db.add(new_mapping)
+                            mapping_dict[(link_obj.id, node.id)] = new_mapping
+                        else:
+                            mapping_obj.key = key
 
             orphan_emails = set(managed_remote_users.keys()) - valid_tokens
             for email in orphan_emails:

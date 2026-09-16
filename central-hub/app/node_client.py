@@ -1,8 +1,7 @@
 import httpx
-
 from app.config import settings
 
-TIMEOUT = 20.0
+TIMEOUT = 30.0
 
 async def ping_node(api_url: str) -> bool:
     try:
@@ -23,13 +22,10 @@ async def list_users_on_node(api_url: str) -> dict[str, str] | None:
                 f"{api_url.rstrip('/')}/users",
                 headers={"X-Node-Secret": settings.NODE_KEY},
             )
-
             if res.status_code == 200:
                 data = res.json()
-
                 if isinstance(data, dict):
                     return data
-
     except Exception:
         return None
 
@@ -51,6 +47,26 @@ async def create_user_on_node(
             if res.status_code == 200:
                 return res.json().get("key")
     except Exception:
+        return None
+
+
+async def create_users_batch_on_node(
+    api_url: str, users: list[dict[str, str | None]]
+) -> list[dict] | None:
+    if not users:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            res = await client.post(
+                f"{api_url.rstrip('/')}/users/batch",
+                json={"users": users},
+                headers={"X-Node-Secret": settings.NODE_KEY},
+            )
+            if res.status_code == 200:
+                return res.json().get("results", [])
+    except Exception as e:
+        print(f"[ERROR] Batch request to {api_url} failed: {e}")
         return None
 
 
