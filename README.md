@@ -30,13 +30,18 @@ wget -qO install.sh https://raw.githubusercontent.com/not-dispersion/xray-subscr
 
 ```
 
+Updaating Central Hub
+```bash
+curl -sSL https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/refs/heads/main/central-hub-update.sh | sudo bash
+```
+
 Follow the interactive prompts (enter root domain and Let's Encrypt email). Once finished, manage your hub anytime using:
 
 ```bash
 sudo central-hub-cli
 
 ```
-
+curl -sSL https://raw.githubusercontent.com/not-dispersion/xray-subscription-server/refs/heads/main/central-hub-update.sh | sudo bash
 ---
 
 ### Step 2: Deploy & Connect Remote Nodes
