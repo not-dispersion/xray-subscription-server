@@ -2,10 +2,12 @@ import json
 import os
 import secrets
 import subprocess
-import uuid
+import tempfile
 import urllib.parse
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
@@ -51,7 +53,10 @@ def load_static_params():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    inbound = next((ib for ib in config["inbounds"] if ib.get("tag") == INBOUND_TAG), config["inbounds"][0])
+    inbound = next(
+        (ib for ib in config["inbounds"] if ib.get("tag") == INBOUND_TAG),
+        config["inbounds"][0],
+    )
     NODE_CACHE["port"] = inbound.get("port", 443)
     NODE_CACHE["sni"] = inbound["streamSettings"]["realitySettings"]["serverNames"][0]
 
@@ -79,12 +84,60 @@ def load_static_params():
         NODE_CACHE["host"] = "127.0.0.1"
 
 
+def xray_add_users_batch(users: list[tuple[str, str]]) -> bool:
+    if not users:
+        return True
+
+    payload = {
+        "tag": INBOUND_TAG,
+        "users": [
+            {
+                "id": client_uuid,
+                "email": email,
+                "flow": "xtls-rprx-vision",
+                "level": 0,
+            }
+            for email, client_uuid in users
+        ],
+    }
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
+        json.dump(payload, tf)
+        tmp_path = tf.name
+
+    try:
+        cmd = [
+            "xray", "api", "adu",
+            f"--server={API_SERVER}",
+            tmp_path,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"[ERROR] xray api adu failed: {res.stderr.strip()}")
+            return False
+        return True
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def xray_remove_user(email: str) -> bool:
+    cmd = [
+        "xray", "api", "rmu",
+        f"--server={API_SERVER}",
+        f"-tag={INBOUND_TAG}",
+        email,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return res.returncode == 0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_static_params()
     state = load_state()
-    for email, client_uuid in state.items():
-        xray_add_user(client_uuid, email)
+    if state:
+        xray_add_users_batch(list(state.items()))
     yield
 
 
@@ -124,31 +177,6 @@ def build_link(client_uuid: str, email: str) -> str:
     )
 
 
-def xray_add_user(client_uuid: str, email: str) -> bool:
-    cmd = [
-        "xray", "api", "addu",
-        f"--server={API_SERVER}",
-        f"--tag={INBOUND_TAG}",
-        f"--email={email}",
-        f"--uuid={client_uuid}",
-        "--flow=xtls-rprx-vision",
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return res.returncode == 0
-
-
-def xray_remove_user(email: str) -> bool:
-    """Вызов xray api rmu на лету без рестарта"""
-    cmd = [
-        "xray", "api", "rmu",
-        f"--server={API_SERVER}",
-        f"--tag={INBOUND_TAG}",
-        f"--email={email}",
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return res.returncode == 0
-
-
 @app.get("/health")
 async def health(x_node_secret: str | None = Header(None, alias="X-Node-Secret")):
     check_auth(x_node_secret)
@@ -169,7 +197,7 @@ async def add_users_batch(
     check_auth(x_node_secret)
     state = load_state()
     response_items = []
-    state_changed = False
+    to_add_to_xray = []
 
     for item in payload.users:
         if item.email in state:
@@ -184,9 +212,8 @@ async def add_users_batch(
             continue
 
         client_uuid = item.uuid or str(uuid.uuid4())
-        xray_add_user(client_uuid, item.email)
+        to_add_to_xray.append((item.email, client_uuid))
         state[item.email] = client_uuid
-        state_changed = True
 
         link = build_link(client_uuid, item.email)
         response_items.append({
@@ -196,7 +223,8 @@ async def add_users_batch(
             "key": link,
         })
 
-    if state_changed:
+    if to_add_to_xray:
+        xray_add_users_batch(to_add_to_xray)
         save_state(state)
 
     return {"results": response_items}

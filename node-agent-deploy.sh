@@ -259,7 +259,24 @@ read -rp "Enter username (email): " email
 
 uuid=$(xray uuid)
 
-if ! xray api addu --server=127.0.0.1:10085 --tag=VLESS-IN --email="$email" --uuid="$uuid" --flow="xtls-rprx-vision"; then
+tmp_json=$(mktemp --suffix=.json)
+trap 'rm -f "$tmp_json"' EXIT
+
+cat << JSON_EOF > "$tmp_json"
+{
+  "tag": "VLESS-IN",
+  "users": [
+    {
+      "id": "$uuid",
+      "email": "$email",
+      "flow": "xtls-rprx-vision",
+      "level": 0
+    }
+  ]
+}
+JSON_EOF
+
+if ! xray api adu --server=127.0.0.1:10085 "$tmp_json"; then
     echo "Error: Failed to add user to Xray API."
     exit 1
 fi
@@ -314,7 +331,7 @@ for i in "${!emails[@]}"; do
     echo "$((i + 1)). ${emails[$i]}"
 done
 
-read -p "Enter client number to remove: " choice
+read -rp "Enter client number to remove: " choice
 if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#emails[@]} )); then
     echo "Error: invalid number."
     exit 1
@@ -322,7 +339,7 @@ fi
 
 selected="${emails[$((choice - 1))]}"
 
-xray api rmu --server=127.0.0.1:10085 --tag=VLESS-IN --email="$selected" || true
+xray api rmu --server=127.0.0.1:10085 -tag="VLESS-IN" "$selected" || true
 tmp=$(mktemp)
 jq --arg email "$selected" 'del(.[$email])' "$state_file" > "$tmp"
 mv "$tmp" "$state_file"
