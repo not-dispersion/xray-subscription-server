@@ -68,7 +68,6 @@ bash -c "$(curl -4 -fSL https://github.com/XTLS/Xray-install/raw/main/install-re
 
 # creating .keys
 short_sid=$(openssl rand -hex 8)
-
 echo "shortsid: $short_sid" > /usr/local/etc/xray/.keys
 xray x25519 >> /usr/local/etc/xray/.keys
 
@@ -81,13 +80,6 @@ cat << EOF > /usr/local/etc/xray/config.json
   "log": {
     "loglevel": "warning"
   },
-  "api": {
-    "tag": "api",
-    "services": [
-      "HandlerService",
-      "StatsService"
-    ]
-  },
   "dns": {
     "servers": [
       "1.1.1.1",
@@ -98,11 +90,6 @@ cat << EOF > /usr/local/etc/xray/config.json
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {
-        "inboundTag": ["api"],
-        "outboundTag": "api",
-        "type": "field"
-      },
       {
         "type": "field",
         "inboundTag": ["dns-in"],
@@ -119,7 +106,6 @@ cat << EOF > /usr/local/etc/xray/config.json
   },
   "inbounds": [
     {
-      "tag": "VLESS-IN",
       "listen": "0.0.0.0",
       "port": 443,
       "protocol": "vless",
@@ -151,15 +137,6 @@ cat << EOF > /usr/local/etc/xray/config.json
           "quic"
         ]
       }
-    },
-    {
-      "tag": "api",
-      "listen": "127.0.0.1",
-      "port": 10085,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "127.0.0.1"
-      }
     }
   ],
   "outbounds": [
@@ -181,12 +158,6 @@ EOF
 
 chmod 644 /usr/local/etc/xray/config.json
 systemctl enable --now xray
-
-mkdir -p /etc/node-agent
-if [[ ! -f /etc/node-agent/users_state.json ]]; then
-    echo "{}" > /etc/node-agent/users_state.json
-    chmod 644 /etc/node-agent/users_state.json
-fi
 
 echo "Installing Node Agent into current working directory."
 install_dir="$(pwd)"
@@ -257,44 +228,22 @@ set -euo pipefail
 read -rp "Enter username (email): " email
 [[ -z "$email" || "$email" == *" "* ]] && { echo "Error: username cannot be empty or contain spaces."; exit 1; }
 
+exists=$(jq --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
+[[ -n "$exists" ]] && { echo "Error: user '$email' already exists."; exit 1; }
+
 uuid=$(xray uuid)
-
-tmp_json=$(mktemp --suffix=.json)
-trap 'rm -f "$tmp_json"' EXIT
-
-cat << JSON_EOF > "$tmp_json"
-{
-  "tag": "VLESS-IN",
-  "users": [
-    {
-      "id": "$uuid",
-      "email": "$email",
-      "flow": "xtls-rprx-vision",
-      "level": 0
-    }
-  ]
-}
-JSON_EOF
-
-if ! xray api adu --server=127.0.0.1:10085 "$tmp_json"; then
-    echo "Error: Failed to add user to Xray API."
-    exit 1
-fi
-
-state_file="/etc/node-agent/users_state.json"
-mkdir -p /etc/node-agent
-if [[ ! -f "$state_file" ]]; then
-    echo "{}" > "$state_file"
-fi
-
 tmp=$(mktemp)
-jq --arg email "$email" --arg uuid "$uuid" '.[$email] = $uuid' "$state_file" > "$tmp"
-mv "$tmp" "$state_file"
-chmod 644 "$state_file"
+jq --arg email "$email" --arg uuid "$uuid" \
+    '.inbounds[0].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' \
+    /usr/local/etc/xray/config.json > "$tmp"
 
-protocol=$(jq -r '.inbounds[] | select(.tag=="VLESS-IN") | .protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[] | select(.tag=="VLESS-IN") | .port' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[] | select(.tag=="VLESS-IN") | .streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
+mv "$tmp" /usr/local/etc/xray/config.json
+chmod 644 /usr/local/etc/xray/config.json
+systemctl restart xray
+
+protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
+port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
+sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
 pbk=$(awk -F': ' '/^Password( \(PublicKey\))?:/ {print $2}' /usr/local/etc/xray/.keys)
 sid=$(awk -F': ' '/^shortsid:/ {print $2}' /usr/local/etc/xray/.keys)
 host=$(curl -4 -s icanhazip.com)
@@ -304,7 +253,7 @@ encoded_pbk=$(echo -n "$pbk" | jq -sRr @uri)
 link="$protocol://$uuid@$host:$port?security=reality&sni=$sni&fp=firefox&pbk=$encoded_pbk&sid=$sid&spx=/&type=tcp&flow=xtls-rprx-vision&encryption=none#$email"
 
 echo
-echo "User added dynamically."
+echo "User added successfully."
 echo "Connection link:"
 echo "$link"
 echo
@@ -320,10 +269,7 @@ set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { echo "Error: Run as root."; exit 1; }
 
-state_file="/etc/node-agent/users_state.json"
-[[ -f "$state_file" ]] || { echo "No users found in $state_file"; exit 1; }
-
-mapfile -t emails < <(jq -r 'keys[]' "$state_file")
+mapfile -t emails < <(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json)
 [[ ${#emails[@]} -eq 0 ]] && { echo "No clients to remove."; exit 1; }
 
 echo "Client list:"
@@ -339,11 +285,11 @@ fi
 
 selected="${emails[$((choice - 1))]}"
 
-xray api rmu --server=127.0.0.1:10085 -tag="VLESS-IN" "$selected" || true
 tmp=$(mktemp)
-jq --arg email "$selected" 'del(.[$email])' "$state_file" > "$tmp"
-mv "$tmp" "$state_file"
-chmod 644 "$state_file"
+jq --arg email "$selected" '(.inbounds[0].settings.clients) |= map(select(.email != $email))' /usr/local/etc/xray/config.json > "$tmp"
+mv "$tmp" /usr/local/etc/xray/config.json
+chmod 644 /usr/local/etc/xray/config.json
+systemctl restart xray
 
 echo "Client '$selected' removed."
 EOF
@@ -354,10 +300,7 @@ cat << 'EOF' > /usr/local/bin/share-link
 #!/bin/bash
 set -euo pipefail
 
-state_file="/etc/node-agent/users_state.json"
-[[ -f "$state_file" ]] || { echo "Error: No state file found."; exit 1; }
-
-mapfile -t emails < <(jq -r 'keys[]' "$state_file")
+mapfile -t emails < <(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json)
 [[ ${#emails[@]} -eq 0 ]] && { echo "No clients found."; exit 1; }
 
 echo "Client list:"
@@ -372,11 +315,11 @@ if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#emails[@]} )); 
 fi
 
 selected="${emails[$((choice - 1))]}"
-uuid=$(jq -r --arg email "$selected" '.[$email]' "$state_file")
+uuid=$(jq -r --arg email "$selected" '.inbounds[0].settings.clients[] | select(.email == $email) | .id' /usr/local/etc/xray/config.json)
 
-protocol=$(jq -r '.inbounds[] | select(.tag=="VLESS-IN") | .protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[] | select(.tag=="VLESS-IN") | .port' /usr/local/etc/xray/config.json)
-sni=$(jq -r '.inbounds[] | select(.tag=="VLESS-IN") | .streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
+protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
+port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
+sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' /usr/local/etc/xray/config.json)
 pbk=$(awk -F': ' '/^Password( \(PublicKey\))?:/ {print $2}' /usr/local/etc/xray/.keys)
 sid=$(awk -F': ' '/^shortsid:/ {print $2}' /usr/local/etc/xray/.keys)
 host=$(curl -4 -s icanhazip.com)
@@ -399,10 +342,7 @@ cat << 'EOF' > /usr/local/bin/user-list
 #!/bin/bash
 set -euo pipefail
 
-state_file="/etc/node-agent/users_state.json"
-[[ -f "$state_file" ]] || { echo "Error: No state file found."; exit 1; }
-
-mapfile -t emails < <(jq -r 'keys[]' "$state_file")
+mapfile -t emails < <(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json)
 [[ ${#emails[@]} -eq 0 ]] && { echo "Error: No clients found."; exit 1; }
 
 echo "Client list:"
@@ -414,4 +354,5 @@ chmod +x /usr/local/bin/user-list
 
 # trigger first user creation
 echo
+echo "Installation complete. Node is ready and listening for central-hub sync."
 echo "Installation complete. To mannualy create a connection link run: sudo new-user"

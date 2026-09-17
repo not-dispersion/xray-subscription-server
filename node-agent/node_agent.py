@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import tempfile
 import urllib.parse
@@ -18,9 +19,6 @@ load_dotenv(BASE_DIR / ".env")
 CONFIG_PATH = "/usr/local/etc/xray/config.json"
 KEYS_PATH = "/usr/local/etc/xray/.keys"
 AGENT_SECRET = os.getenv("NODE_KEY")
-INBOUND_TAG = "VLESS-IN"
-API_SERVER = "127.0.0.1:10085"
-STATE_FILE = Path("/etc/node-agent/users_state.json")
 
 NODE_CACHE = {
     "host": "",
@@ -31,32 +29,11 @@ NODE_CACHE = {
 }
 
 
-def load_state() -> dict[str, str]:
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-
-def save_state(state: dict[str, str]):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp_file = STATE_FILE.with_name(f"{STATE_FILE.name}.tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-    tmp_file.replace(STATE_FILE)
-
-
 def load_static_params():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    inbound = next(
-        (ib for ib in config["inbounds"] if ib.get("tag") == INBOUND_TAG),
-        config["inbounds"][0],
-    )
+    inbound = config["inbounds"][0]
     NODE_CACHE["port"] = inbound.get("port", 443)
     NODE_CACHE["sni"] = inbound["streamSettings"]["realitySettings"]["serverNames"][0]
 
@@ -84,60 +61,9 @@ def load_static_params():
         NODE_CACHE["host"] = "127.0.0.1"
 
 
-def xray_add_users_batch(users: list[tuple[str, str]]) -> bool:
-    if not users:
-        return True
-
-    payload = {
-        "tag": INBOUND_TAG,
-        "users": [
-            {
-                "id": client_uuid,
-                "email": email,
-                "flow": "xtls-rprx-vision",
-                "level": 0,
-            }
-            for email, client_uuid in users
-        ],
-    }
-
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
-        json.dump(payload, tf)
-        tmp_path = tf.name
-
-    try:
-        cmd = [
-            "xray", "api", "adu",
-            f"--server={API_SERVER}",
-            tmp_path,
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            print(f"[ERROR] xray api adu failed: {res.stderr.strip()}")
-            return False
-        return True
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-def xray_remove_user(email: str) -> bool:
-    cmd = [
-        "xray", "api", "rmu",
-        f"--server={API_SERVER}",
-        f"-tag={INBOUND_TAG}",
-        email,
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return res.returncode == 0
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_static_params()
-    state = load_state()
-    if state:
-        xray_add_users_batch(list(state.items()))
     yield
 
 
@@ -159,6 +85,17 @@ def check_auth(secret: str | None):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid node secret",
         )
+
+
+def atomic_write_config(config: dict):
+    dir_name = os.path.dirname(CONFIG_PATH)
+    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+        json.dump(config, tf, indent=2, ensure_ascii=False)
+        temp_path = tf.name
+
+    os.chmod(temp_path, 0o644)
+    shutil.move(temp_path, CONFIG_PATH)
+    subprocess.run(["systemctl", "restart", "xray"], check=True)
 
 
 def build_link(client_uuid: str, email: str) -> str:
@@ -186,7 +123,10 @@ async def health(x_node_secret: str | None = Header(None, alias="X-Node-Secret")
 @app.get("/users")
 async def list_users(x_node_secret: str | None = Header(None, alias="X-Node-Secret")):
     check_auth(x_node_secret)
-    return load_state()
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    clients = config["inbounds"][0]["settings"].get("clients", [])
+    return {c["email"]: c.get("id") for c in clients if c.get("email") and c.get("id")}
 
 
 @app.post("/users/batch")
@@ -195,13 +135,19 @@ async def add_users_batch(
     x_node_secret: str | None = Header(None, alias="X-Node-Secret"),
 ):
     check_auth(x_node_secret)
-    state = load_state()
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    clients = config["inbounds"][0]["settings"].setdefault("clients", [])
+    existing_clients = {c.get("email"): c.get("id") for c in clients if c.get("email")}
+
     response_items = []
-    to_add_to_xray = []
+    modified = False
 
     for item in payload.users:
-        if item.email in state:
-            existing_uuid = state[item.email]
+        if item.email in existing_clients:
+            existing_uuid = existing_clients[item.email]
             link = build_link(existing_uuid, item.email)
             response_items.append({
                 "status": "already_exists",
@@ -212,8 +158,13 @@ async def add_users_batch(
             continue
 
         client_uuid = item.uuid or str(uuid.uuid4())
-        to_add_to_xray.append((item.email, client_uuid))
-        state[item.email] = client_uuid
+        clients.append({
+            "id": client_uuid,
+            "email": item.email,
+            "flow": "xtls-rprx-vision",
+        })
+        existing_clients[item.email] = client_uuid
+        modified = True
 
         link = build_link(client_uuid, item.email)
         response_items.append({
@@ -223,9 +174,8 @@ async def add_users_batch(
             "key": link,
         })
 
-    if to_add_to_xray:
-        xray_add_users_batch(to_add_to_xray)
-        save_state(state)
+    if modified:
+        atomic_write_config(config)
 
     return {"results": response_items}
 
@@ -235,13 +185,17 @@ async def delete_user(
     email: str, x_node_secret: str | None = Header(None, alias="X-Node-Secret")
 ):
     check_auth(x_node_secret)
-    state = load_state()
 
-    if email not in state:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    clients = config["inbounds"][0]["settings"].get("clients", [])
+    new_clients = [c for c in clients if c.get("email") != email]
+
+    if len(clients) == len(new_clients):
         return {"status": "not_found", "email": email}
 
-    xray_remove_user(email)
-    del state[email]
-    save_state(state)
+    config["inbounds"][0]["settings"]["clients"] = new_clients
+    atomic_write_config(config)
 
     return {"status": "deleted", "email": email}
